@@ -1,6 +1,6 @@
 # Kaggle Chatbot MVP
 
-MVP educacional para responder perguntas sobre datasets do Kaggle via Streamlit, com treino de modelos simples (regressão logística ou linear) e documentação organizada.
+MVP educacional para respondre à pergunta "Qual a nota em matemática" projeto de Marcelo Henrique e Luiz Orlando
 
 ---
 

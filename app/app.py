@@ -20,8 +20,17 @@ from core.models.predict import evaluate_classifier, evaluate_regressor
 from core.explain.coefficients import extract_logit_importances, extract_linear_importances
 from core.chatbot.rules import answer_from_metrics
 
-st.set_page_config(page_title="📚 Students Performance - CHATBOT", layout="wide")
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
+st.set_page_config(page_title="📚 Students Performance - (CHATBOT + IA)", layout="wide")
+st.title("📚 Students Performance - CHATBOT")
+
+# -----------------------------
+# Inicialização do estado
+# -----------------------------
 if "model_trained" not in st.session_state:
     st.session_state.model_trained = False
 if "predictions_made" not in st.session_state:
@@ -36,6 +45,8 @@ if "metrics" not in st.session_state:
     st.session_state.metrics = None
 if "importances" not in st.session_state:
     st.session_state.importances = None
+if "uploaded_dfs" not in st.session_state:
+    st.session_state.uploaded_dfs = {}
 
 MODEL_DIR = "model"
 if not os.path.exists(MODEL_DIR):
@@ -46,8 +57,37 @@ MODEL_PATH = os.path.join(MODEL_DIR, "off_model.pickle")
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode("utf-8")
 
-st.title("📚 Students Performance - CHATBOT")
+def get_openai_client():
+    key = "KEY AQUI"
+    if not key or OpenAI is None:
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        return None
 
+def build_rag_context(df: pd.DataFrame, max_chars: int = 4000) -> str:
+    num_cols = df.select_dtypes(include='number').columns
+    cat_cols = df.select_dtypes(include=['object','category','bool']).columns
+    parts = [f"Shape: {df.shape[0]} x {df.shape[1]}"]
+    if len(num_cols) > 0:
+        desc = df[num_cols].describe().T
+        desc['median'] = df[num_cols].median()
+        cols = ['count','mean','median','std','min','max']
+        parts.append("[Resumo Numérico]\n" + desc[cols].to_string())
+    if len(cat_cols) > 0:
+        cat_summary = []
+        for c in cat_cols:
+            vc = df[c].value_counts(dropna=False).head(5)
+            cat_summary.append(f"{c}:\n{vc.to_string()}")
+        parts.append("[Resumo Categórico]\n" + "\n".join(cat_summary))
+    ctx = "\n\n".join(parts)
+    return ctx[:max_chars] + ("\n... (contexto truncado)" if len(ctx) > max_chars else "")
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
 with st.sidebar:
     st.header("1. Upload da Base de Dados")
     uploaded_files = st.file_uploader(
@@ -55,6 +95,13 @@ with st.sidebar:
         type=["csv", "tsv"],
         accept_multiple_files=True
     )
+
+    # Lê e guarda DataFrames no session_state
+    if uploaded_files:
+        for file in uploaded_files:
+            if file.name not in st.session_state.uploaded_dfs:
+                df = read_csv(file)
+                st.session_state.uploaded_dfs[file.name] = df
 
     st.header("2. Ações")
 
@@ -64,9 +111,9 @@ with st.sidebar:
 
     if st.button("Treinar Modelo"):
         df_train = None
-        for file in uploaded_files:
-            if file.name.endswith((".csv", ".tsv")) and "test" not in file.name.lower():
-                df_train = read_csv(file)
+        for name, df in st.session_state.uploaded_dfs.items():
+            if name.endswith((".csv", ".tsv")) and "test" not in name.lower():
+                df_train = df
 
         if df_train is not None:
             with st.spinner("Treinando o modelo..."):
@@ -96,8 +143,8 @@ with st.sidebar:
                     st.session_state.metrics = evaluate_regressor(model, X_test, y_test)
                     st.session_state.importances = extract_linear_importances(model, X.columns, pre)
 
-                with open(MODEL_PATH, "wb") as f:
-                    pickle.dump(model, f)
+                with open(MODEL_PATH, "wb") as file:
+                    pickle.dump(model, file)
 
                 st.session_state.model_trained = True
                 st.session_state.predictions_made = False
@@ -111,17 +158,17 @@ with st.sidebar:
             st.error("Nenhum modelo salvo encontrado. Treine um modelo primeiro.")
         else:
             df_test = None
-            for file in uploaded_files:
-                if file.name.endswith((".csv", ".tsv")) and "test" not in file.name.lower():
-                    df_test = read_csv(file)
+            for name, df in st.session_state.uploaded_dfs.items():
+                if name.endswith((".csv", ".tsv")) and "test" not in name.lower():
+                    df_test = df
 
             if df_test is not None:
                 with st.spinner("Carregando modelo e fazendo previsões..."):
                     run_etl_for_test_data(df_test)
                     df_spec_predict = load_data("spec_math")
 
-                    with open(MODEL_PATH, "rb") as f:
-                        model = pickle.load(f)
+                    with open(MODEL_PATH, "rb") as file:
+                        model = pickle.load(file)
 
                     ids = df_spec_predict[["code"]] if "code" in df_spec_predict.columns else None
                     X_predict = df_spec_predict.drop(columns=["code"], errors="ignore")
@@ -147,7 +194,10 @@ with st.sidebar:
         st.info("Banco, modelo e sessão resetados.")
         st.rerun()
 
-tab_train, tab_predict, tab_chat = st.tabs(["📊 Resultados do Treino", "🚀 Previsões", "💬 Chat"])
+# -----------------------------
+# Abas principais
+# -----------------------------
+tab_train, tab_predict, tab_chat, tab_rag = st.tabs(["📊 Resultados do Treino", "🚀 Previsões", "💬 Chat", "💬 Chat Ia"])
 
 with tab_train:
     st.header("Resultados do Modelo")
@@ -190,4 +240,64 @@ with tab_chat:
                 importances_df=st.session_state.importances
             )
             st.session_state.chat_messages.append({"role": "assistant", "content": response})
+            st.rerun()
+
+with tab_rag:
+    st.header("🤖 Chat RAG — Perguntas com Contexto da Base")
+
+    # Carrega o dataset base
+    df_rag = None
+    for name, df in st.session_state.uploaded_dfs.items():
+        if name.endswith((".csv", ".tsv")) and "test" not in name.lower():
+            df_rag = df
+
+    if df_rag is None:
+        st.info("Faça upload de Train.csv ou StudentsPerformance.csv para usar o chat RAG.")
+    else:
+        max_ctx_chars = st.slider("Limite do contexto (caracteres)", 500, 12000, 4000, step=500)
+        show_rag_ctx = st.checkbox("Mostrar contexto RAG", value=False)
+
+        rag_context = build_rag_context(df_rag, max_chars=max_ctx_chars)
+        if show_rag_ctx:
+            with st.expander("📊 Ver contexto RAG (resumo da base)"):
+                st.text(rag_context)
+
+        if "rag_messages" not in st.session_state:
+            st.session_state.rag_messages = [
+                {"role": "assistant", "content": "Olá! Eu posso responder perguntas sobre a base de empréstimos com base no contexto gerado."}
+            ]
+
+        for msg in st.session_state.rag_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        rag_prompt = st.chat_input("Pergunte algo sobre o conjunto de dados ou as variáveis...")
+
+        if rag_prompt:
+            st.session_state.rag_messages.append({"role": "user", "content": rag_prompt})
+            messages = [
+                {"role": "system", "content": "Você é um professor de matemática. Use o contexto fornecido para responder perguntas sobre os dados."},
+                {"role": "user", "content": f"Contexto (resumo da base):\n{rag_context}"}
+            ]
+            for m in st.session_state.rag_messages:
+                if m["role"] in ("user", "assistant"):
+                    messages.append(m)
+
+            client = get_openai_client()
+            if client:
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        temperature=0.3
+                    )
+                    reply = response.choices[0].message.content
+                except Exception as e:
+                    reply = f"⚠️ Erro ao acessar a OpenAI: {e}"
+            else:
+                reply = f"(Sem OpenAI configurado)\nPergunta: {rag_prompt}\n\nContexto:\n{rag_context[:1000]}..."
+
+            st.session_state.rag_messages.append({"role": "assistant", "content": reply})
+            with st.chat_message("assistant"):
+                st.markdown(reply)
             st.rerun()
